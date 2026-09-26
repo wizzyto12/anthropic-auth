@@ -17,7 +17,7 @@ import {
   onCleanup,
   Show,
 } from 'solid-js'
-import { createRpcClient } from './rpc/rpc-client.js'
+import { createRpcClient, type RpcClient } from './rpc/rpc-client.js'
 import { getRpcDir } from './rpc/rpc-dir.js'
 import {
   type AccountQuota,
@@ -916,13 +916,14 @@ const tui: TuiPlugin = async (api) => {
 
   if (!rpcPollStarted) {
     rpcPollStarted = true
-    const rpcClient = createRpcClient(
-      getRpcDir(api.state.path.directory ?? ''),
-      process.pid,
-    )
+    // The OpenCode 2 host adapter supplies a client over the host's RPC
+    // channel; OpenCode 1 pairs through the per-directory port file.
+    const rpcClient =
+      (api as { rpcClient?: RpcClient }).rpcClient ??
+      createRpcClient(getRpcDir(api.state.path.directory ?? ''), process.pid)
     let lastNotificationId = 0
     let rpcInFlight = false
-    setInterval(() => {
+    const rpcPoll = setInterval(() => {
       if (rpcInFlight) return
       const current = (api.route as { current?: unknown }).current
       const resolved =
@@ -954,6 +955,12 @@ const tui: TuiPlugin = async (api) => {
           rpcInFlight = false
         })
     }, RPC_POLL_MS)
+    // OpenCode 2 disposes and re-runs plugins (reloads, re-activation); stop
+    // this generation's poll so dialogs never open once per generation.
+    ;(api as { onDispose?: (dispose: () => void) => void }).onDispose?.(() => {
+      clearInterval(rpcPoll)
+      rpcPollStarted = false
+    })
   }
 }
 

@@ -8,6 +8,18 @@ import type { AccountDialogAccount } from '../rpc/protocol'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import { formatPrimeCost, formatPrimeTime } from '../sidebar-state.js'
 
+type DialogPromptProps = Parameters<TuiPluginApi['ui']['DialogPrompt']>[0]
+
+/**
+ * V1's DialogPrompt renders `description` as JSX; the OpenCode 2 adapter
+ * (`v2-host.mjs`) can only show text, so prompts also carry `descriptionText`.
+ */
+function promptDialog(api: TuiPluginApi) {
+  return api.ui.DialogPrompt as (
+    props: DialogPromptProps & { descriptionText?: string },
+  ) => ReturnType<TuiPluginApi['ui']['DialogPrompt']>
+}
+
 type ApplyFn = (
   command: OpenDialogPayload['command'],
   args: string,
@@ -426,12 +438,13 @@ export function openCommandDialog(
     const seed = window
       ? `${String(window.startHour).padStart(2, '0')}-${String(window.endHour).padStart(2, '0')}`
       : ''
-    const DialogPrompt = api.ui.DialogPrompt
+    const DialogPrompt = promptDialog(api)
     api.ui.dialog.setSize('xlarge')
     api.ui.dialog.replace(() => (
       <DialogPrompt
         title='Claude cachekeep schedule'
         description={() => <text>{payload.text}</text>}
+        descriptionText={payload.text}
         placeholder="'always', HH-HH (e.g. 08-20), or 'off'"
         value={seed}
         onConfirm={(value: string) => {
@@ -514,12 +527,13 @@ export function openCommandDialog(
     const seed = buildKillswitchThresholdSeed(config, accountIds)
 
     const openEdit = () => {
-      const DialogPrompt = api.ui.DialogPrompt
+      const DialogPrompt = promptDialog(api)
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
         <DialogPrompt
           title='Killswitch thresholds'
           description={() => <text>{payload.text}</text>}
+          descriptionText={payload.text}
           placeholder='main:5,10,0 work-alt:5,10,0'
           value={seed}
           onConfirm={(value: string) => {
@@ -709,12 +723,13 @@ export function openCommandDialog(
       } = {}
 
       const openApiKeyPrompt = () => {
-        const DialogPrompt = api.ui.DialogPrompt
+        const DialogPrompt = promptDialog(api)
         api.ui.dialog.setSize('xlarge')
         api.ui.dialog.replace(() => (
           <DialogPrompt
             title='Add API key account \u2014 API key'
             description={() => <text>Paste your API key (required).</text>}
+            descriptionText={'Paste your API key (required).'}
             placeholder='sk-ant-...'
             value=''
             onConfirm={(value: string) => {
@@ -732,7 +747,7 @@ export function openCommandDialog(
       }
 
       const openBaseURLPrompt = () => {
-        const DialogPrompt = api.ui.DialogPrompt
+        const DialogPrompt = promptDialog(api)
         api.ui.dialog.setSize('xlarge')
         api.ui.dialog.replace(() => (
           <DialogPrompt
@@ -743,6 +758,9 @@ export function openCommandDialog(
                 https://api.kie.ai/claude
               </text>
             )}
+            descriptionText={
+              'Anthropic-compatible API base URL. Default: https://api.kie.ai/claude'
+            }
             placeholder='https://api.kie.ai/claude'
             value=''
             onConfirm={(value: string) => {
@@ -784,7 +802,7 @@ export function openCommandDialog(
       }
 
       const openLabelPrompt = () => {
-        const DialogPrompt = api.ui.DialogPrompt
+        const DialogPrompt = promptDialog(api)
         api.ui.dialog.setSize('xlarge')
         api.ui.dialog.replace(() => (
           <DialogPrompt
@@ -792,6 +810,7 @@ export function openCommandDialog(
             description={() => (
               <text>A short name for this account (optional).</text>
             )}
+            descriptionText={'A short name for this account (optional).'}
             placeholder='e.g. Work API'
             value=''
             onConfirm={(value: string) => {
@@ -888,7 +907,7 @@ export function openCommandDialog(
     }
 
     const openOAuthCodePrompt = (oauthUrl: string) => {
-      const DialogPrompt = api.ui.DialogPrompt
+      const DialogPrompt = promptDialog(api)
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
         <DialogPrompt
@@ -899,6 +918,9 @@ export function openCommandDialog(
               URL or authorization code below.
             </text>
           )}
+          descriptionText={
+            'After signing in you will be redirected. Paste the full callback URL or authorization code below.'
+          }
           placeholder='Paste callback URL or code here'
           value=''
           onConfirm={(value: string) => {
@@ -919,7 +941,7 @@ export function openCommandDialog(
     }
 
     const openOAuthLabelPrompt = (code: string, oauthUrl: string) => {
-      const DialogPrompt = api.ui.DialogPrompt
+      const DialogPrompt = promptDialog(api)
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
         <DialogPrompt
@@ -927,6 +949,7 @@ export function openCommandDialog(
           description={() => (
             <text>A short name for this account (optional).</text>
           )}
+          descriptionText={'A short name for this account (optional).'}
           placeholder='e.g. work'
           value=''
           onConfirm={(value: string) => {

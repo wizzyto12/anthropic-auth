@@ -14,6 +14,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./server": {
+      "import": "./dist/v2/server.js",
+      "types": "./dist/v2/server.d.ts"
+    },
     "./tui": {
       "types": "./dist/tui.d.ts",
       "import": "./src/tui/entry.mjs"
@@ -34,18 +38,20 @@
     "bun": "1.3.14"
   },
   "files": [
+    "LICENSE",
+    "README.md",
     "dist",
-    "src/tui.tsx",
+    "server.js",
+    "src/rpc",
+    "src/sidebar-state.ts",
     "src/tui",
     "src/tui-compiled",
-    "src/sidebar-state.ts",
     "src/tui-preferences.ts",
-    "src/rpc",
-    "README.md",
-    "LICENSE"
+    "src/tui.tsx",
+    "tui.js"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external jsonc-parser --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui && bun run check:bundle",
+    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --root src --target node --format esm --splitting --external @opencode-ai/plugin --external jsonc-parser --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui && bun run check:bundle",
     "build:tui": "bun scripts/build-tui.ts",
     "smoke:tui": "bun scripts/smoke-tui-pack-install.ts",
     "check:bundle": "bun scripts/check-bundle-globals.ts",

@@ -34,4 +34,17 @@ if (!mod) {
   }
 }
 
-export default mod.default
+const v1 = mod.default
+
+// OpenCode 1 reads `tui`; OpenCode 2 validates `{ id, setup }` and ignores
+// `tui`, so one object serves both hosts. The V2 lane runs the same V1
+// components through an adapter built from the V2 context.
+async function setup(context) {
+  const { createV1Api, isV2TuiContext } = await import('./v2-host.mjs')
+  if (!isV2TuiContext(context)) return
+  const host = createV1Api(context)
+  await v1.tui(host.api)
+  return () => host.dispose()
+}
+
+export default { id: v1.id, tui: v1.tui, setup }
