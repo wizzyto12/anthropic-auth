@@ -83,11 +83,42 @@ describe('OpenCode 2 setup', () => {
         refresh: 'r',
         expires: 1,
       }
-      const refreshed = await oauth.refresh(credential)
-      // Never exchanges the refresh token (that would race the V1 pipeline).
-      expect(refreshed.refresh).toBe('r')
-      expect(refreshed.access).toBe('a')
-      expect(refreshed.expires).toBeGreaterThan(Date.now())
+      const originalFetch = globalThis.fetch
+      const tokenCalls: string[] = []
+      globalThis.fetch = (async (
+        input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => {
+        const url = String(input)
+        if (url.includes('/oauth/token')) {
+          tokenCalls.push(String(init?.body))
+          return new Response(
+            JSON.stringify({
+              access_token: 'rotated-access',
+              refresh_token: 'rotated-refresh',
+              expires_in: 28800,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        return originalFetch(input, init)
+      }) as typeof fetch
+      try {
+        const [first, second] = await Promise.all([
+          oauth.refresh(credential),
+          oauth.refresh(credential),
+        ])
+        expect(tokenCalls).toHaveLength(1)
+        expect(first).toEqual(second)
+        expect(first.access).toBe('rotated-access')
+        expect(first.refresh).toBe('rotated-refresh')
+        expect(first.expires).toBeGreaterThan(Date.now())
+        const again = await oauth.refresh(credential)
+        expect(tokenCalls).toHaveLength(1)
+        expect(again.refresh).toBe('rotated-refresh')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
 
       const http = hooks.find((h) => h.name === 'http.request')
       expect(http?.options).toEqual({ providerID: 'anthropic' })

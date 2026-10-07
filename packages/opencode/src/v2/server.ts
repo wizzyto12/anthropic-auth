@@ -26,7 +26,7 @@
  * marking) have no bridge yet. The TUI is a separate entry.
  */
 
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import {
   createServer,
   type IncomingMessage,
@@ -35,6 +35,7 @@ import {
 } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { Readable } from 'node:stream'
+import { refreshClaudeOAuthToken } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start.ts'
 import { drainNotifications } from '../rpc/notifications.ts'
@@ -66,6 +67,63 @@ const V1_SESSION_EVENTS = new Set([
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const UPSTREAM_HEADER = 'x-cortexkit-v2-upstream'
 const SECRET_HEADER = 'x-cortexkit-v2-secret'
+const refreshInFlight = new Map<string, Promise<OAuthCredential>>()
+const REFRESH_CACHE_GRACE_MS = 60_000
+const refreshSettled = new Map<
+  string,
+  { credential: OAuthCredential; timer: ReturnType<typeof setTimeout> }
+>()
+
+function refreshTokenKey(refresh: string) {
+  return createHash('sha256').update(refresh).digest('hex')
+}
+
+function rememberRefresh(key: string, credential: OAuthCredential) {
+  const previous = refreshSettled.get(key)
+  if (previous) clearTimeout(previous.timer)
+  const timer = setTimeout(() => {
+    if (refreshSettled.get(key)?.credential === credential) {
+      refreshSettled.delete(key)
+    }
+  }, REFRESH_CACHE_GRACE_MS)
+  timer.unref?.()
+  refreshSettled.set(key, { credential, timer })
+}
+
+async function rotateOAuthCredential(
+  credential: OAuthCredential,
+): Promise<OAuthCredential> {
+  if (!credential.refresh) {
+    throw new Error('Anthropic token refresh failed: missing refresh token')
+  }
+  const key = refreshTokenKey(credential.refresh)
+  const settled = refreshSettled.get(key)
+  if (settled) return settled.credential
+  const shared = refreshInFlight.get(key)
+  if (shared) return shared
+  const pending = (async () => {
+    const rotated = await refreshClaudeOAuthToken({
+      refreshToken: credential.refresh,
+      maxRetries: 0,
+    })
+    return {
+      type: 'oauth' as const,
+      methodID: credential.methodID,
+      access: rotated.access,
+      refresh: rotated.refresh,
+      expires: rotated.expires,
+    }
+  })()
+  refreshInFlight.set(key, pending)
+  try {
+    const rotated = await pending
+    rememberRefresh(key, rotated)
+    return rotated
+  } finally {
+    if (refreshInFlight.get(key) === pending) refreshInFlight.delete(key)
+  }
+}
+
 const HOP_BY_HOP = new Set([
   'connection',
   'content-length',
@@ -520,14 +578,7 @@ export async function setup(context: V2Context) {
             },
           }
         },
-        // Never exchange the refresh token here: the V1 pipeline refreshes
-        // under the shared-store lock, and presenting one refresh token from
-        // two places revokes the whole token family. V2's stored bearer is
-        // replaced on the bridge, so only its expiry needs to move forward.
-        refresh: async (credential: OAuthCredential) => ({
-          ...credential,
-          expires: Date.now() + 60 * 60 * 1000,
-        }),
+        refresh: rotateOAuthCredential,
       })
     }),
   )
