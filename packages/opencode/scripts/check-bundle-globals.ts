@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises'
+import { readdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const bundlePath = join(import.meta.dir, '..', 'dist', 'index.js')
@@ -11,13 +11,30 @@ try {
   throw new Error(`Bundle artifact check failed: ${bundlePath} is missing`)
 }
 
-if (size <= minBundleBytes) {
+if (size <= 0) {
   throw new Error(
     `Bundle artifact check failed: ${bundlePath} is not substantial (${size} bytes)`,
   )
 }
 
-const bundle = await readFile(bundlePath, 'utf8')
+// Multiple entries (index.js, v2/server.js) share code via split chunks, so
+// the implementation lives in dist/index-*.js rather than dist/index.js.
+const distDir = join(import.meta.dir, '..', 'dist')
+const chunkNames = (await readdir(distDir)).filter((name) =>
+  /^index-.*\.js$/.test(name),
+)
+const bundle = (
+  await Promise.all(
+    [bundlePath, ...chunkNames.map((name) => join(distDir, name))].map((file) =>
+      readFile(file, 'utf8'),
+    ),
+  )
+).join('\n')
+if (bundle.length <= minBundleBytes) {
+  throw new Error(
+    `Bundle artifact check failed: bundled output is not substantial (${bundle.length} bytes)`,
+  )
+}
 const registryMatches = bundle.match(/__anthropicAuthRpcServers/g)?.length ?? 0
 if (registryMatches === 0) {
   throw new Error(

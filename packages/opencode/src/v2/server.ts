@@ -42,7 +42,15 @@ import { COMMAND_MODAL_NAMES } from '../rpc/protocol.ts'
 import { createRpcClient } from '../rpc/rpc-client.ts'
 import { getRpcDir } from '../rpc/rpc-dir.ts'
 import { ANTHROPIC_AUTH_RPC } from '../rpc/v2-contract.mjs'
-import type { OpenCodeAnthropicAuth } from '../shared-auth.ts'
+
+/** Shape the V1 `auth.loader` `getAuth` returns (see AnthropicAuthPlugin). */
+type OpenCodeAnthropicAuth = {
+  type: string
+  access?: string
+  refresh?: string
+  expires?: number
+  key?: string
+}
 
 const PLUGIN_ID = '@cortexkit/opencode-anthropic-auth'
 const INTEGRATION_ID = 'anthropic'
@@ -570,10 +578,9 @@ export async function setup(context: V2Context) {
           lastReceivedId?: number
           sessionId?: string
         }) => ({
-          messages: drainNotifications(
-            input.lastReceivedId ?? 0,
-            input.sessionId,
-          ),
+          messages: input.sessionId
+            ? drainNotifications(input.lastReceivedId ?? 0, input.sessionId)
+            : [],
         }),
         apply: async (input: Parameters<typeof local.apply>[0]) =>
           local.apply(input),
