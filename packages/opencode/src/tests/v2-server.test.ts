@@ -4,6 +4,7 @@ import {
   setup,
   startLoopbackBridge,
   type V2Context,
+  waitForHostRefresh,
 } from '../v2/server'
 
 const FAR_FUTURE = Date.now() + 24 * 60 * 60 * 1000
@@ -119,6 +120,14 @@ describe('OpenCode 2 setup', () => {
       } finally {
         globalThis.fetch = originalFetch
       }
+
+      const waited = await waitForHostRefresh({
+        refresh: 'r',
+        getAuth: async () => ({ type: 'oauth', refresh: 'r' }),
+        now: () => 0,
+        sleep: async () => {},
+      })
+      expect(waited).toBe('rotated-access')
 
       const http = hooks.find((h) => h.name === 'http.request')
       expect(http?.options).toEqual({ providerID: 'anthropic' })

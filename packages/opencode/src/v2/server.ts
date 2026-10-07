@@ -90,6 +90,37 @@ function rememberRefresh(key: string, credential: OAuthCredential) {
   refreshSettled.set(key, { credential, timer })
 }
 
+const HOST_REFRESH_WAIT_MS = 30_000
+
+export async function waitForHostRefresh(input: {
+  refresh: string
+  getAuth: () => Promise<OpenCodeAnthropicAuth>
+  now?: () => number
+  sleep?: (ms: number) => Promise<void>
+}): Promise<string | null> {
+  const key = refreshTokenKey(input.refresh)
+  const deadline = (input.now ?? Date.now)() + HOST_REFRESH_WAIT_MS
+  const sleep =
+    input.sleep ??
+    ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
+  while ((input.now ?? Date.now)() < deadline) {
+    const settled = refreshSettled.get(key)
+    if (settled?.credential.access) return settled.credential.access
+    const latest = await input.getAuth()
+    if (
+      latest.type === 'oauth' &&
+      latest.access &&
+      latest.refresh &&
+      latest.refresh !== input.refresh &&
+      (!latest.expires || latest.expires > (input.now ?? Date.now)())
+    ) {
+      return latest.access
+    }
+    await sleep(250)
+  }
+  return null
+}
+
 async function rotateOAuthCredential(
   credential: OAuthCredential,
 ): Promise<OAuthCredential> {
@@ -502,6 +533,7 @@ export async function startLoopbackBridge(
 
 export async function setup(context: V2Context) {
   if (!isOpenCode2HostContext(context)) return async () => {}
+  process.env.OPENCODE_ANTHROPIC_AUTH_HOST_REFRESH = '1'
 
   const state: HostState = { busy: new Map(), laneStarts: new Set() }
   const hooks = (await AnthropicAuthPlugin({

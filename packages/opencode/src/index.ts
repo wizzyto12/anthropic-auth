@@ -4986,6 +4986,19 @@ const anthropicAuthPlugin = async (
             await resolveMainQuotaAccountIdentity(auth.access)
           }
           async function refreshMainAccessToken(rejectedAccess?: string) {
+            if (process.env.OPENCODE_ANTHROPIC_AUTH_HOST_REFRESH === '1') {
+              const current = await getAuth()
+              if (current.type !== 'oauth' || !current.refresh) {
+                throw new Error('Token refresh failed: missing refresh token')
+              }
+              const { waitForHostRefresh } = await import('./v2/server.ts')
+              const access = await waitForHostRefresh({
+                refresh: current.refresh,
+                getAuth,
+              })
+              if (access) return access
+              throw new Error('Claude OAuth refresh is already in progress')
+            }
             if (rejectedAccess) {
               const currentAuth = await getAuth()
               if (
