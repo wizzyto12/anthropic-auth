@@ -365,6 +365,21 @@ function trailingAssistantHistoryFailureResponse(
   return localInvalidRequestResponse(error.message)
 }
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
+// OpenCode 2 refreshes credentials expiring within this window itself.
+const HOST_REFRESH_WINDOW_MS = 5 * 60_000
+const HOST_REFRESH_OWNERS = Symbol.for(
+  'cortexkit.anthropic-auth.host-refresh-owners',
+)
+const HOST_OWNED_MARKER = Symbol.for('cortexkit.anthropic-auth.host-owned')
+function hostOwnsRefresh() {
+  const holder = globalThis as {
+    [HOST_REFRESH_OWNERS]?: number
+    [HOST_OWNED_MARKER]?: boolean
+  }
+  return (
+    (holder[HOST_REFRESH_OWNERS] ?? 0) > 0 || holder[HOST_OWNED_MARKER] === true
+  )
+}
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
 const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
@@ -4986,10 +5001,27 @@ const anthropicAuthPlugin = async (
             await resolveMainQuotaAccountIdentity(auth.access)
           }
           async function refreshMainAccessToken(rejectedAccess?: string) {
-            if (process.env.OPENCODE_ANTHROPIC_AUTH_HOST_REFRESH === '1') {
+            if (hostOwnsRefresh()) {
               const current = await getAuth()
               if (current.type !== 'oauth' || !current.refresh) {
                 throw new Error('Token refresh failed: missing refresh token')
+              }
+              if (rejectedAccess !== undefined && current.access) {
+                if (
+                  current.access !== rejectedAccess &&
+                  (!current.expires || current.expires > Date.now())
+                ) {
+                  return current.access
+                }
+                if (
+                  current.access === rejectedAccess &&
+                  current.expires &&
+                  current.expires - Date.now() > HOST_REFRESH_WINDOW_MS
+                ) {
+                  throw new Error(
+                    'Claude OAuth credential was rejected and the host will not refresh it; re-login required',
+                  )
+                }
               }
               const { waitForHostRefresh } = await import('./v2/server.ts')
               const access = await waitForHostRefresh({
@@ -5352,6 +5384,7 @@ const anthropicAuthPlugin = async (
 
             const run = async () => {
               try {
+                if (hostOwnsRefresh()) return
                 const storage = await loadAccounts(accountStoragePath)
                 if (!mainRefreshEnabled(storage)) return
                 const latestAuth = await getAuth()

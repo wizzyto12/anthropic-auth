@@ -53,6 +53,43 @@ export class ClaudeOAuthRefreshError extends Error {
   }
 }
 
+/** A 2xx token response whose body is not a usable token pair. */
+export class ClaudeOAuthMalformedResponseError extends Error {
+  constructor(detail: string) {
+    super(`Claude OAuth refresh returned a malformed response: ${detail}`)
+    this.name = 'ClaudeOAuthMalformedResponseError'
+  }
+}
+
+function validateRefreshPayload(json: unknown, fallbackRefresh: string) {
+  if (typeof json !== 'object' || json === null) {
+    throw new ClaudeOAuthMalformedResponseError('body is not an object')
+  }
+  const body = json as Record<string, unknown>
+  if (typeof body.access_token !== 'string' || !body.access_token.trim()) {
+    throw new ClaudeOAuthMalformedResponseError('missing access_token')
+  }
+  if (
+    typeof body.expires_in !== 'number' ||
+    !Number.isFinite(body.expires_in) ||
+    body.expires_in <= 0
+  ) {
+    throw new ClaudeOAuthMalformedResponseError('invalid expires_in')
+  }
+  if (
+    body.refresh_token !== undefined &&
+    (typeof body.refresh_token !== 'string' || !body.refresh_token.trim())
+  ) {
+    throw new ClaudeOAuthMalformedResponseError('invalid refresh_token')
+  }
+  return {
+    access_token: body.access_token,
+    expires_in: body.expires_in,
+    refresh_token:
+      (body.refresh_token as string | undefined) ?? fallbackRefresh,
+  }
+}
+
 export type ClaudeOAuthRefreshResult = {
   access: string
   refresh: string
@@ -69,6 +106,7 @@ export async function refreshClaudeOAuthToken(input: {
   maxRetries?: number
   baseDelayMs?: number
   setTimeoutImpl?: typeof globalThis.setTimeout
+  signal?: AbortSignal
 }): Promise<ClaudeOAuthRefreshResult> {
   assertNotCustodyTombstone(input.refreshToken, 'anthropic')
   if (typeof input.refreshToken !== 'string' || !input.refreshToken.trim()) {
@@ -99,6 +137,7 @@ export async function refreshClaudeOAuthToken(input: {
           client_id: CLIENT_ID,
           scope: REFRESH_SCOPE,
         }),
+        ...(input.signal ? { signal: input.signal } : {}),
       })
 
       if (!response.ok) {
@@ -114,22 +153,22 @@ export async function refreshClaudeOAuthToken(input: {
         )
       }
 
-      const json = (await response.json()) as {
-        access_token: string
-        refresh_token?: string
-        expires_in: number
-      }
+      const json = validateRefreshPayload(
+        await response.json(),
+        input.refreshToken,
+      )
       const refreshedAt = input.now?.() ?? Date.now()
 
       return {
         access: json.access_token,
-        refresh: json.refresh_token ?? input.refreshToken,
+        refresh: json.refresh_token,
         expires: refreshedAt + json.expires_in * 1000,
         expiresIn: json.expires_in,
         authLineageId: input.authLineageId,
       }
     } catch (error) {
       if (error instanceof ClaudeOAuthRefreshError) throw error
+      if (input.signal?.aborted) throw error
       if (attempt < maxRetries && isTransientNetworkError(error)) continue
       throw error
     }

@@ -35,7 +35,10 @@ import {
 } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { Readable } from 'node:stream'
-import { refreshClaudeOAuthToken } from '@cortexkit/anthropic-auth-core'
+import {
+  ClaudeOAuthRefreshError,
+  refreshClaudeOAuthToken,
+} from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start.ts'
 import { drainNotifications } from '../rpc/notifications.ts'
@@ -70,26 +73,96 @@ const UPSTREAM_HEADER = 'x-cortexkit-v2-upstream'
 const SECRET_HEADER = 'x-cortexkit-v2-secret'
 const refreshInFlight = new Map<string, Promise<OAuthCredential>>()
 const blockedRefresh = new Map<string, string>()
+const REFRESH_COOLDOWN_DEFAULT_MS = 60_000
+const REFRESH_COOLDOWN_MIN_MS = 5_000
+const REFRESH_COOLDOWN_MAX_MS = 10 * 60_000
+const refreshCooldowns = new Map<string, { until: number; message: string }>()
 const REFRESH_CACHE_GRACE_MS = 60_000
+const REFRESH_EXCHANGE_TIMEOUT_MS = 30_000
+const CONSUMED_REFRESH_MESSAGE =
+  'Anthropic refresh token was already exchanged; re-authentication is required'
 const refreshSettled = new Map<
   string,
-  { credential: OAuthCredential; timer: ReturnType<typeof setTimeout> }
+  {
+    credential: OAuthCredential
+    until: number
+    consumed: boolean
+    timer: ReturnType<typeof setTimeout>
+  }
 >()
+
+export const HOST_REFRESH_FLAG = Symbol.for(
+  'cortexkit.anthropic-auth.host-refresh-owners',
+)
+
+export const HOST_OWNED_MARKER = Symbol.for(
+  'cortexkit.anthropic-auth.host-owned',
+)
+
+type HostRefreshGlobal = {
+  [HOST_REFRESH_FLAG]?: number
+  [HOST_OWNED_MARKER]?: boolean
+}
+
+function acquireHostRefreshOwnership() {
+  const holder = globalThis as HostRefreshGlobal
+  holder[HOST_REFRESH_FLAG] = (holder[HOST_REFRESH_FLAG] ?? 0) + 1
+  // Process-lifetime: an orphaned V1 instance must never exchange tokens once
+  // any V2 host has owned refresh, even after the last cleanup.
+  holder[HOST_OWNED_MARKER] = true
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const next = (holder[HOST_REFRESH_FLAG] ?? 1) - 1
+    if (next > 0) holder[HOST_REFRESH_FLAG] = next
+    else delete holder[HOST_REFRESH_FLAG]
+  }
+}
 
 function refreshTokenKey(refresh: string) {
   return createHash('sha256').update(refresh).digest('hex')
 }
 
-function rememberRefresh(key: string, credential: OAuthCredential) {
+// Once the grace window closes, a rotated-away refresh token is spent for good
+// in this process: presenting it again would risk a second submission.
+function expireSettledRefresh(key: string) {
+  const settled = refreshSettled.get(key)
+  if (!settled) return
+  clearTimeout(settled.timer)
+  refreshSettled.delete(key)
+  if (settled.consumed) blockedRefresh.set(key, CONSUMED_REFRESH_MESSAGE)
+}
+
+function liveSettledRefresh(key: string) {
+  const settled = refreshSettled.get(key)
+  if (!settled) return undefined
+  if (Date.now() >= settled.until) {
+    expireSettledRefresh(key)
+    return undefined
+  }
+  return settled
+}
+
+function rememberRefresh(
+  key: string,
+  credential: OAuthCredential,
+  consumed: boolean,
+) {
   const previous = refreshSettled.get(key)
   if (previous) clearTimeout(previous.timer)
   const timer = setTimeout(() => {
     if (refreshSettled.get(key)?.credential === credential) {
-      refreshSettled.delete(key)
+      expireSettledRefresh(key)
     }
   }, REFRESH_CACHE_GRACE_MS)
   timer.unref?.()
-  refreshSettled.set(key, { credential, timer })
+  refreshSettled.set(key, {
+    credential,
+    until: Date.now() + REFRESH_CACHE_GRACE_MS,
+    consumed,
+    timer,
+  })
 }
 
 const HOST_REFRESH_WAIT_MS = 30_000
@@ -106,7 +179,7 @@ export async function waitForHostRefresh(input: {
     input.sleep ??
     ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
   while ((input.now ?? Date.now)() < deadline) {
-    const settled = refreshSettled.get(key)
+    const settled = liveSettledRefresh(key)
     if (settled?.credential.access) return settled.credential.access
     const latest = await input.getAuth()
     if (
@@ -123,6 +196,40 @@ export async function waitForHostRefresh(input: {
   return null
 }
 
+function refreshFailureMessage(error: unknown) {
+  return error instanceof Error
+    ? error.message
+    : 'Anthropic token refresh failed'
+}
+
+function cooldownFor(error: ClaudeOAuthRefreshError) {
+  const requested = error.retryAfter ? error.retryAfter * 1000 : undefined
+  return Math.min(
+    REFRESH_COOLDOWN_MAX_MS,
+    Math.max(REFRESH_COOLDOWN_MIN_MS, requested ?? REFRESH_COOLDOWN_DEFAULT_MS),
+  )
+}
+
+// Only outcomes where the server may already have consumed the refresh token
+// (network/timeout, 5xx, malformed 2xx) or definitively revoked it
+// (invalid_grant) block it for the process. A definite 4xx rejection leaves
+// the token intact, so it only cools down.
+function classifyRefreshFailure(key: string, error: unknown) {
+  const message = refreshFailureMessage(error)
+  if (error instanceof ClaudeOAuthRefreshError && error.status < 500) {
+    if (error.status === 400 && /invalid_grant/i.test(error.body)) {
+      blockedRefresh.set(key, message)
+      return
+    }
+    refreshCooldowns.set(key, {
+      until: Date.now() + cooldownFor(error),
+      message,
+    })
+    return
+  }
+  blockedRefresh.set(key, message)
+}
+
 async function rotateOAuthCredential(
   credential: OAuthCredential,
 ): Promise<OAuthCredential> {
@@ -130,17 +237,23 @@ async function rotateOAuthCredential(
     throw new Error('Anthropic token refresh failed: missing refresh token')
   }
   const key = refreshTokenKey(credential.refresh)
-  const settled = refreshSettled.get(key)
+  const settled = liveSettledRefresh(key)
   if (settled) return settled.credential
   const shared = refreshInFlight.get(key)
   if (shared) return shared
   const blocked = blockedRefresh.get(key)
   if (blocked) throw new Error(blocked)
+  const cooling = refreshCooldowns.get(key)
+  if (cooling) {
+    if (Date.now() < cooling.until) throw new Error(cooling.message)
+    refreshCooldowns.delete(key)
+  }
   const pending = (async () => {
     try {
       const rotated = await refreshClaudeOAuthToken({
         refreshToken: credential.refresh,
         maxRetries: 0,
+        signal: AbortSignal.timeout(REFRESH_EXCHANGE_TIMEOUT_MS),
       })
       return {
         type: 'oauth' as const,
@@ -150,19 +263,14 @@ async function rotateOAuthCredential(
         expires: rotated.expires,
       }
     } catch (error) {
-      blockedRefresh.set(
-        key,
-        error instanceof Error
-          ? error.message
-          : 'Anthropic token refresh failed',
-      )
+      classifyRefreshFailure(key, error)
       throw error
     }
   })()
   refreshInFlight.set(key, pending)
   try {
     const rotated = await pending
-    rememberRefresh(key, rotated)
+    rememberRefresh(key, rotated, rotated.refresh !== credential.refresh)
     return rotated
   } finally {
     if (refreshInFlight.get(key) === pending) refreshInFlight.delete(key)
@@ -286,6 +394,7 @@ export function isOpenCode2HostContext(context: unknown): context is V2Context {
 // ---------------------------------------------------------------------------
 
 type V1Hooks = {
+  dispose?: () => Promise<void>
   auth: {
     loader: (
       getAuth: () => Promise<OpenCodeAnthropicAuth>,
@@ -547,292 +656,335 @@ export async function startLoopbackBridge(
 
 export async function setup(context: V2Context) {
   if (!isOpenCode2HostContext(context)) return async () => {}
-  process.env.OPENCODE_ANTHROPIC_AUTH_HOST_REFRESH = '1'
+  const release = acquireHostRefreshOwnership()
+  let cleanup: () => Promise<void>
+  try {
+    cleanup = await setupHost(context)
+  } catch (error) {
+    release()
+    throw error
+  }
+  return async () => {
+    try {
+      await cleanup()
+    } finally {
+      release()
+    }
+  }
+}
 
+async function setupHost(context: V2Context) {
   const state: HostState = { busy: new Map(), laneStarts: new Set() }
   const hooks = (await AnthropicAuthPlugin({
     client: createClientShim(context, state),
     directory: context.location.directory,
   } as never)) as unknown as V1Hooks
 
-  const getAuth = async (): Promise<OpenCodeAnthropicAuth> => {
-    const connection = await context.integration.connection
-      .active(INTEGRATION_ID)
-      .catch(() => undefined)
-    if (!connection) return toV1Auth(undefined)
-    const credential = await context.integration.connection
-      .resolve(connection)
-      .catch(() => undefined)
-    return toV1Auth(credential)
-  }
-
-  // The V1 loader is called once per provider load in V1; here once per
-  // process, retried until it yields a fetch (e.g. after the first login).
-  let loaded: Promise<typeof fetch | undefined> | undefined
-  const getFetch = () => {
-    loaded ??= hooks.auth
-      .loader(getAuth, { models: {} })
-      .then((result) => result.fetch)
-      .catch(() => undefined)
-    return loaded.then((fetchFn) => {
-      if (!fetchFn) loaded = undefined
-      return fetchFn
-    })
-  }
-
-  const bridge = await startLoopbackBridge(getFetch)
+  // Everything below can throw after V1 resources already exist, so cleanup is
+  // defined first and also serves as the rollback for a partial setup.
   const registrations: Registration[] = []
+  const events = new AbortController()
+  let startedBridge: LoopbackBridge | undefined
+  let cleaned = false
+  const cleanup = async () => {
+    if (cleaned) return
+    cleaned = true
+    // V1 resources (background refresh, fallback/quota timers, RPC server)
+    // are stopped first; no step may skip the others.
+    await hooks.dispose?.().catch(() => {})
+    try {
+      events.abort()
+    } catch {}
+    for (const registration of registrations.reverse()) {
+      await registration.dispose().catch(() => {})
+    }
+    await startedBridge?.close().catch(() => {})
+  }
 
-  // -- Integration: Claude Pro/Max OAuth ------------------------------------
-  const oauthMethod = hooks.auth.methods.find(
-    (method) => method.type === 'oauth' && method.authorize,
-  )
-  registrations.push(
-    await context.integration.transform((editor) => {
-      for (const methodID of [LIVE_METHOD_ID, LEGACY_METHOD_ID])
-        editor.method.update({
-          integrationID: INTEGRATION_ID,
-          method: {
-            id: methodID,
-            type: 'oauth',
-            label: oauthMethod?.label ?? 'Claude Pro/Max',
-          },
-          authorize: async () => {
-            if (!oauthMethod?.authorize) throw new Error('OAuth is unavailable')
-            const flow = await oauthMethod.authorize()
-            return {
-              url: flow.url,
-              instructions: flow.instructions,
-              mode: 'code',
-              callback: async (code: string): Promise<OAuthCredential> => {
-                const result = await flow.callback(code)
-                if (
-                  result.type !== 'success' ||
-                  !result.access ||
-                  !result.refresh
-                ) {
-                  throw new Error('Anthropic authorization failed')
-                }
-                // A new login changes the account the V1 pipeline resolves.
-                loaded = undefined
-                return {
-                  type: 'oauth',
-                  methodID: LIVE_METHOD_ID,
-                  access: result.access,
-                  refresh: result.refresh,
-                  expires: result.expires ?? Date.now() + 60 * 60 * 1000,
-                }
-              },
-            }
-          },
-          refresh: rotateOAuthCredential,
-        })
-    }),
-  )
+  try {
+    const getAuth = async (): Promise<OpenCodeAnthropicAuth> => {
+      const connection = await context.integration.connection
+        .active(INTEGRATION_ID)
+        .catch(() => undefined)
+      if (!connection) return toV1Auth(undefined)
+      const credential = await context.integration.connection
+        .resolve(connection)
+        .catch(() => undefined)
+      return toV1Auth(credential)
+    }
 
-  // -- Requests: route Anthropic HTTP through the V1 fetch ------------------
-  registrations.push(
-    await context.session.hook(
-      'http.request',
-      async (event: { request: Request }) => {
-        if (!(await getFetch())) return // API-key auth: V2 handles it natively.
-        const original = event.request
-        const url = new URL(original.url)
-        const headers = new Headers(original.headers)
-        headers.set(UPSTREAM_HEADER, url.toString())
-        headers.set(SECRET_HEADER, bridge.secret)
-        event.request = new Request(
-          `${bridge.origin}${url.pathname}${url.search}`,
-          {
-            method: original.method,
-            headers,
-            body:
-              original.method === 'GET' || original.method === 'HEAD'
-                ? undefined
-                : await original.clone().arrayBuffer(),
-            signal: original.signal,
-          },
-        )
-      },
-      { providerID: INTEGRATION_ID },
-    ),
-  )
+    // The V1 loader is called once per provider load in V1; here once per
+    // process, retried until it yields a fetch (e.g. after the first login).
+    let loaded: Promise<typeof fetch | undefined> | undefined
+    const getFetch = () => {
+      loaded ??= hooks.auth
+        .loader(getAuth, { models: {} })
+        .then((result) => result.fetch)
+        .catch(() => undefined)
+      return loaded.then((fetchFn) => {
+        if (!fetchFn) loaded = undefined
+        return fetchFn
+      })
+    }
 
-  // -- TUI channel: host RPC -> this process's V1 RPC server ----------------
-  // The V1 TUI pairs with its server through a port file keyed by project
-  // directory, but one OpenCode 2 server serves every project. The host RPC
-  // routes the TUI to this server; forward to the V1 RPC server in-process so
-  // its notification queue and TUI-connected tracking stay authoritative.
-  if (context.rpc) {
-    const local = createRpcClient(
-      getRpcDir(context.location.directory),
-      process.pid,
+    const bridge = await startLoopbackBridge(getFetch)
+    startedBridge = bridge
+
+    // -- Integration: Claude Pro/Max OAuth ------------------------------------
+    const oauthMethod = hooks.auth.methods.find(
+      (method) => method.type === 'oauth' && method.authorize,
     )
     registrations.push(
-      await context.rpc.register(ANTHROPIC_AUTH_RPC, {
-        // The notification queue and TUI-connected tracking are process-wide,
-        // so drain in-process whichever location instance answers.
-        pending: async (input: {
-          lastReceivedId?: number
-          sessionId?: string
-        }) => ({
-          messages: input.sessionId
-            ? drainNotifications(input.lastReceivedId ?? 0, input.sessionId)
-            : [],
-        }),
-        apply: async (input: Parameters<typeof local.apply>[0]) =>
-          local.apply(input),
+      await context.integration.transform((editor) => {
+        for (const methodID of [LIVE_METHOD_ID, LEGACY_METHOD_ID])
+          editor.method.update({
+            integrationID: INTEGRATION_ID,
+            method: {
+              id: methodID,
+              type: 'oauth',
+              label: oauthMethod?.label ?? 'Claude Pro/Max',
+            },
+            authorize: async () => {
+              if (!oauthMethod?.authorize)
+                throw new Error('OAuth is unavailable')
+              const flow = await oauthMethod.authorize()
+              return {
+                url: flow.url,
+                instructions: flow.instructions,
+                mode: 'code',
+                callback: async (code: string): Promise<OAuthCredential> => {
+                  const result = await flow.callback(code)
+                  if (
+                    result.type !== 'success' ||
+                    !result.access ||
+                    !result.refresh
+                  ) {
+                    throw new Error('Anthropic authorization failed')
+                  }
+                  // A new login changes the account the V1 pipeline resolves.
+                  loaded = undefined
+                  return {
+                    type: 'oauth',
+                    methodID: LIVE_METHOD_ID,
+                    access: result.access,
+                    refresh: result.refresh,
+                    expires: result.expires ?? Date.now() + 60 * 60 * 1000,
+                  }
+                },
+              }
+            },
+            refresh: rotateOAuthCredential,
+          })
       }),
     )
-  }
 
-  // -- Lane start: tag the warm turn's request (V1 chat.message/chat.headers)
-  registrations.push(
-    await context.session.hook(
-      'model.request',
-      (
-        event: SessionScope & { kind: string; headers: Record<string, string> },
-      ) => {
-        if (event.kind !== 'primary') return
-        if (!state.laneStarts.delete(event.sessionID)) return
-        event.headers[LANE_START_REQUEST_HEADER] = '1'
-      },
-      { providerID: INTEGRATION_ID },
-    ),
-  )
-
-  // -- Session events: desktop notices and per-session cleanup (V1 `event`)
-  const events = new AbortController()
-  const eventHook = (
-    hooks as { event?: (input: { event: unknown }) => Promise<void> }
-  ).event
-  if (context.event && eventHook) {
-    const stream = context.event.subscribe({ signal: events.signal })
-    void (async () => {
-      for await (const event of stream) {
-        if (!V1_SESSION_EVENTS.has(event.type)) continue
-        const data = event.data ?? {}
-        const sessionID =
-          typeof data.sessionID === 'string' ? data.sessionID : undefined
-        if (event.type === 'session.status' && sessionID) {
-          const status = data.status as { type?: string } | undefined
-          if (status?.type && status.type !== 'idle') {
-            state.busy.set(sessionID, { type: status.type })
-          } else {
-            state.busy.delete(sessionID)
-          }
-        }
-        if (event.type === 'session.idle' && sessionID)
-          state.busy.delete(sessionID)
-        if (event.type === 'session.deleted' && sessionID) {
-          state.busy.delete(sessionID)
-          state.laneStarts.delete(sessionID)
-        }
-        await eventHook({
-          event: { type: event.type, properties: data },
-        }).catch(() => {})
-      }
-    })().catch(() => {})
-  }
-
-  // -- System prompt: parallel tool-use guidance ----------------------------
-  const systemTransform = hooks['experimental.chat.system.transform']
-  if (systemTransform) {
+    // -- Requests: route Anthropic HTTP through the V1 fetch ------------------
     registrations.push(
       await context.session.hook(
-        'context',
-        async (
-          event: SessionScope & {
-            system: Array<{ type: string; text: string }>
-          },
-        ) => {
-          const system: string[] = []
-          await systemTransform(
+        'http.request',
+        async (event: { request: Request }) => {
+          if (!(await getFetch())) return // API-key auth: V2 handles it natively.
+          const original = event.request
+          const url = new URL(original.url)
+          const headers = new Headers(original.headers)
+          headers.set(UPSTREAM_HEADER, url.toString())
+          headers.set(SECRET_HEADER, bridge.secret)
+          event.request = new Request(
+            `${bridge.origin}${url.pathname}${url.search}`,
             {
-              sessionID: event.sessionID,
-              model: {
-                providerID: event.model.providerID,
-                api: { npm: '@ai-sdk/anthropic' },
-              },
+              method: original.method,
+              headers,
+              body:
+                original.method === 'GET' || original.method === 'HEAD'
+                  ? undefined
+                  : await original.clone().arrayBuffer(),
+              signal: original.signal,
             },
-            { system },
           )
-          for (const text of system) event.system.push({ type: 'text', text })
         },
         { providerID: INTEGRATION_ID },
       ),
     )
-  }
 
-  // -- Models: zero per-token costs under subscription OAuth ----------------
-  const auth = await getAuth().catch(() => undefined)
-  if (hooks.provider) {
-    // Ask the V1 hook whether it would zero a priced model under this auth
-    // (subscription OAuth with cost zeroing enabled).
-    const PROBE_ID = '__anthropic_auth_cost_probe__'
-    const probe = await hooks.provider
-      .models(
-        { models: { [PROBE_ID]: { cost: { input: 1, output: 1 } } } },
-        { auth: { type: auth?.type } },
+    // -- TUI channel: host RPC -> this process's V1 RPC server ----------------
+    // The V1 TUI pairs with its server through a port file keyed by project
+    // directory, but one OpenCode 2 server serves every project. The host RPC
+    // routes the TUI to this server; forward to the V1 RPC server in-process so
+    // its notification queue and TUI-connected tracking stay authoritative.
+    if (context.rpc) {
+      const local = createRpcClient(
+        getRpcDir(context.location.directory),
+        process.pid,
       )
-      .catch(() => undefined)
-    const probeCost = probe?.[PROBE_ID]?.cost as { input?: number } | undefined
-    const zeroing = probeCost?.input === 0
-    if (zeroing) {
       registrations.push(
-        await context.model.transform((editor) => {
-          for (const model of editor.list(INTEGRATION_ID)) {
-            editor.update(INTEGRATION_ID, model.id, (item) => {
-              item.cost = zeroCost(item.cost)
+        await context.rpc.register(ANTHROPIC_AUTH_RPC, {
+          // The notification queue and TUI-connected tracking are process-wide,
+          // so drain in-process whichever location instance answers.
+          pending: async (input: {
+            lastReceivedId?: number
+            sessionId?: string
+          }) => ({
+            messages: input.sessionId
+              ? drainNotifications(input.lastReceivedId ?? 0, input.sessionId)
+              : [],
+          }),
+          apply: async (input: Parameters<typeof local.apply>[0]) =>
+            local.apply(input),
+        }),
+      )
+    }
+
+    // -- Lane start: tag the warm turn's request (V1 chat.message/chat.headers)
+    registrations.push(
+      await context.session.hook(
+        'model.request',
+        (
+          event: SessionScope & {
+            kind: string
+            headers: Record<string, string>
+          },
+        ) => {
+          if (event.kind !== 'primary') return
+          if (!state.laneStarts.delete(event.sessionID)) return
+          event.headers[LANE_START_REQUEST_HEADER] = '1'
+        },
+        { providerID: INTEGRATION_ID },
+      ),
+    )
+
+    // -- Session events: desktop notices and per-session cleanup (V1 `event`)
+    const eventHook = (
+      hooks as { event?: (input: { event: unknown }) => Promise<void> }
+    ).event
+    if (context.event && eventHook) {
+      const stream = context.event.subscribe({ signal: events.signal })
+      void (async () => {
+        for await (const event of stream) {
+          if (!V1_SESSION_EVENTS.has(event.type)) continue
+          const data = event.data ?? {}
+          const sessionID =
+            typeof data.sessionID === 'string' ? data.sessionID : undefined
+          if (event.type === 'session.status' && sessionID) {
+            const status = data.status as { type?: string } | undefined
+            if (status?.type && status.type !== 'idle') {
+              state.busy.set(sessionID, { type: status.type })
+            } else {
+              state.busy.delete(sessionID)
+            }
+          }
+          if (event.type === 'session.idle' && sessionID)
+            state.busy.delete(sessionID)
+          if (event.type === 'session.deleted' && sessionID) {
+            state.busy.delete(sessionID)
+            state.laneStarts.delete(sessionID)
+          }
+          await eventHook({
+            event: { type: event.type, properties: data },
+          }).catch(() => {})
+        }
+      })().catch(() => {})
+    }
+
+    // -- System prompt: parallel tool-use guidance ----------------------------
+    const systemTransform = hooks['experimental.chat.system.transform']
+    if (systemTransform) {
+      registrations.push(
+        await context.session.hook(
+          'context',
+          async (
+            event: SessionScope & {
+              system: Array<{ type: string; text: string }>
+            },
+          ) => {
+            const system: string[] = []
+            await systemTransform(
+              {
+                sessionID: event.sessionID,
+                model: {
+                  providerID: event.model.providerID,
+                  api: { npm: '@ai-sdk/anthropic' },
+                },
+              },
+              { system },
+            )
+            for (const text of system) event.system.push({ type: 'text', text })
+          },
+          { providerID: INTEGRATION_ID },
+        ),
+      )
+    }
+
+    // -- Models: zero per-token costs under subscription OAuth ----------------
+    const auth = await getAuth().catch(() => undefined)
+    if (hooks.provider) {
+      // Ask the V1 hook whether it would zero a priced model under this auth
+      // (subscription OAuth with cost zeroing enabled).
+      const PROBE_ID = '__anthropic_auth_cost_probe__'
+      const probe = await hooks.provider
+        .models(
+          { models: { [PROBE_ID]: { cost: { input: 1, output: 1 } } } },
+          { auth: { type: auth?.type } },
+        )
+        .catch(() => undefined)
+      const probeCost = probe?.[PROBE_ID]?.cost as
+        | { input?: number }
+        | undefined
+      const zeroing = probeCost?.input === 0
+      if (zeroing) {
+        registrations.push(
+          await context.model.transform((editor) => {
+            for (const model of editor.list(INTEGRATION_ID)) {
+              editor.update(INTEGRATION_ID, model.id, (item) => {
+                item.cost = zeroCost(item.cost)
+              })
+            }
+          }),
+        )
+      }
+    }
+
+    // -- Slash commands --------------------------------------------------------
+    const commandHook = hooks['command.execute.before']
+    if (hooks.config && commandHook) {
+      const config: { command?: Record<string, { description?: string }> } = {}
+      await hooks.config(config)
+      registrations.push(
+        await context.command.transform((editor) => {
+          for (const [name, definition] of Object.entries(
+            config.command ?? {},
+          )) {
+            if (!(COMMAND_MODAL_NAMES as readonly string[]).includes(name))
+              continue
+            editor.add({
+              name,
+              description: definition.description,
+              execute: async ({ sessionID, prompt }) => {
+                try {
+                  await commandHook({
+                    command: name,
+                    arguments: prompt?.text?.trim() ?? '',
+                    sessionID,
+                  })
+                } catch (error) {
+                  if (
+                    error instanceof Error &&
+                    error.message === HANDLED_SENTINEL
+                  ) {
+                    return
+                  }
+                  throw error
+                }
+              },
             })
           }
         }),
       )
     }
-  }
 
-  // -- Slash commands --------------------------------------------------------
-  const commandHook = hooks['command.execute.before']
-  if (hooks.config && commandHook) {
-    const config: { command?: Record<string, { description?: string }> } = {}
-    await hooks.config(config)
-    registrations.push(
-      await context.command.transform((editor) => {
-        for (const [name, definition] of Object.entries(config.command ?? {})) {
-          if (!(COMMAND_MODAL_NAMES as readonly string[]).includes(name))
-            continue
-          editor.add({
-            name,
-            description: definition.description,
-            execute: async ({ sessionID, prompt }) => {
-              try {
-                await commandHook({
-                  command: name,
-                  arguments: prompt?.text?.trim() ?? '',
-                  sessionID,
-                })
-              } catch (error) {
-                if (
-                  error instanceof Error &&
-                  error.message === HANDLED_SENTINEL
-                ) {
-                  return
-                }
-                throw error
-              }
-            },
-          })
-        }
-      }),
-    )
-  }
-
-  return async () => {
-    events.abort()
-    for (const registration of registrations.reverse()) {
-      await registration.dispose().catch(() => {})
-    }
-    await bridge.close()
+    return cleanup
+  } catch (error) {
+    await cleanup()
+    throw error
   }
 }
 

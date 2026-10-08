@@ -4963,6 +4963,7 @@ export class FallbackAccountManager {
         authLineageId: sourceAccount.authLineageId,
         fetchImpl: this.fetchImpl,
         now: this.now,
+        maxRetries: 0,
       })
       sourceAccount.access = refreshed.access
       sourceAccount.refresh = refreshed.refresh

@@ -90,7 +90,7 @@ describe('OpenCode 2 setup', () => {
       const originalFetch = globalThis.fetch
       const tokenCalls: string[] = []
       globalThis.fetch = (async (
-        input: RequestInfo | URL,
+        input: Parameters<typeof fetch>[0],
         init?: RequestInit,
       ) => {
         const url = String(input)
@@ -148,7 +148,7 @@ describe('OpenCode 2 setup', () => {
       const oauth = methods.find((m) => m.method?.id === 'claude-max')
       const originalFetch = globalThis.fetch
       let calls = 0
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
+      globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
         if (String(input).includes('/oauth/token')) {
           calls += 1
           return new Response('no', { status: 500 })
