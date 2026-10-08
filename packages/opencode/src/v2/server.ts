@@ -55,9 +55,10 @@ type OpenCodeAnthropicAuth = {
 
 const PLUGIN_ID = '@cortexkit/opencode-anthropic-auth'
 const INTEGRATION_ID = 'anthropic'
-// The V2 migration imports a legacy auth.json `anthropic` oauth entry with
-// methodID "oauth"; registering the same id takes over those logins.
-const OAUTH_METHOD_ID = 'oauth'
+// ex-machina stores the live login as claude-max. A V2 import of legacy
+// auth.json uses oauth. Both must be registered or the host never refreshes.
+const LIVE_METHOD_ID = 'claude-max'
+const LEGACY_METHOD_ID = 'oauth'
 // V1 `event` consumers read only these session lifecycle events.
 const V1_SESSION_EVENTS = new Set([
   'session.status',
@@ -68,6 +69,7 @@ const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const UPSTREAM_HEADER = 'x-cortexkit-v2-upstream'
 const SECRET_HEADER = 'x-cortexkit-v2-secret'
 const refreshInFlight = new Map<string, Promise<OAuthCredential>>()
+const blockedRefresh = new Map<string, string>()
 const REFRESH_CACHE_GRACE_MS = 60_000
 const refreshSettled = new Map<
   string,
@@ -132,17 +134,29 @@ async function rotateOAuthCredential(
   if (settled) return settled.credential
   const shared = refreshInFlight.get(key)
   if (shared) return shared
+  const blocked = blockedRefresh.get(key)
+  if (blocked) throw new Error(blocked)
   const pending = (async () => {
-    const rotated = await refreshClaudeOAuthToken({
-      refreshToken: credential.refresh,
-      maxRetries: 0,
-    })
-    return {
-      type: 'oauth' as const,
-      methodID: credential.methodID,
-      access: rotated.access,
-      refresh: rotated.refresh,
-      expires: rotated.expires,
+    try {
+      const rotated = await refreshClaudeOAuthToken({
+        refreshToken: credential.refresh,
+        maxRetries: 0,
+      })
+      return {
+        type: 'oauth' as const,
+        methodID: credential.methodID,
+        access: rotated.access,
+        refresh: rotated.refresh,
+        expires: rotated.expires,
+      }
+    } catch (error) {
+      blockedRefresh.set(
+        key,
+        error instanceof Error
+          ? error.message
+          : 'Anthropic token refresh failed',
+      )
+      throw error
     }
   })()
   refreshInFlight.set(key, pending)
@@ -575,43 +589,44 @@ export async function setup(context: V2Context) {
   )
   registrations.push(
     await context.integration.transform((editor) => {
-      editor.method.update({
-        integrationID: INTEGRATION_ID,
-        method: {
-          id: OAUTH_METHOD_ID,
-          type: 'oauth',
-          label: oauthMethod?.label ?? 'Claude Pro/Max',
-        },
-        authorize: async () => {
-          if (!oauthMethod?.authorize) throw new Error('OAuth is unavailable')
-          const flow = await oauthMethod.authorize()
-          return {
-            url: flow.url,
-            instructions: flow.instructions,
-            mode: 'code',
-            callback: async (code: string): Promise<OAuthCredential> => {
-              const result = await flow.callback(code)
-              if (
-                result.type !== 'success' ||
-                !result.access ||
-                !result.refresh
-              ) {
-                throw new Error('Anthropic authorization failed')
-              }
-              // A new login changes the account the V1 pipeline resolves.
-              loaded = undefined
-              return {
-                type: 'oauth',
-                methodID: OAUTH_METHOD_ID,
-                access: result.access,
-                refresh: result.refresh,
-                expires: result.expires ?? Date.now() + 60 * 60 * 1000,
-              }
-            },
-          }
-        },
-        refresh: rotateOAuthCredential,
-      })
+      for (const methodID of [LIVE_METHOD_ID, LEGACY_METHOD_ID])
+        editor.method.update({
+          integrationID: INTEGRATION_ID,
+          method: {
+            id: methodID,
+            type: 'oauth',
+            label: oauthMethod?.label ?? 'Claude Pro/Max',
+          },
+          authorize: async () => {
+            if (!oauthMethod?.authorize) throw new Error('OAuth is unavailable')
+            const flow = await oauthMethod.authorize()
+            return {
+              url: flow.url,
+              instructions: flow.instructions,
+              mode: 'code',
+              callback: async (code: string): Promise<OAuthCredential> => {
+                const result = await flow.callback(code)
+                if (
+                  result.type !== 'success' ||
+                  !result.access ||
+                  !result.refresh
+                ) {
+                  throw new Error('Anthropic authorization failed')
+                }
+                // A new login changes the account the V1 pipeline resolves.
+                loaded = undefined
+                return {
+                  type: 'oauth',
+                  methodID: LIVE_METHOD_ID,
+                  access: result.access,
+                  refresh: result.refresh,
+                  expires: result.expires ?? Date.now() + 60 * 60 * 1000,
+                }
+              },
+            }
+          },
+          refresh: rotateOAuthCredential,
+        })
     }),
   )
 

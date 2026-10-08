@@ -70,10 +70,13 @@ describe('OpenCode 2 setup', () => {
     const { context, methods, hooks, commands } = createContext()
     const cleanup = await setup(context)
     try {
-      const oauth = methods.find((m) => m.method?.type === 'oauth')
+      const oauthMethods = methods.filter((m) => m.method?.type === 'oauth')
+      const oauth = oauthMethods.find((m) => m.method.id === 'claude-max')
       expect(oauth.integrationID).toBe('anthropic')
-      // Matches the methodID the V2 migration gives legacy auth.json logins.
-      expect(oauth.method.id).toBe('oauth')
+      expect(oauthMethods.map((m) => m.method.id).sort()).toEqual([
+        'claude-max',
+        'oauth',
+      ])
       expect(typeof oauth.authorize).toBe('function')
       expect(typeof oauth.refresh).toBe('function')
 
@@ -133,6 +136,39 @@ describe('OpenCode 2 setup', () => {
       expect(http?.options).toEqual({ providerID: 'anthropic' })
       expect(hooks.some((h) => h.name === 'context')).toBe(true)
       expect(commands.map((c) => c.name)).toContain('claude-quota')
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test('does not present a refresh token again after the exchange fails', async () => {
+    const { context, methods } = createContext()
+    const cleanup = await setup(context)
+    try {
+      const oauth = methods.find((m) => m.method?.id === 'claude-max')
+      const originalFetch = globalThis.fetch
+      let calls = 0
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        if (String(input).includes('/oauth/token')) {
+          calls += 1
+          return new Response('no', { status: 500 })
+        }
+        return originalFetch(input)
+      }) as typeof fetch
+      const credential = {
+        type: 'oauth' as const,
+        methodID: 'claude-max',
+        access: 'a',
+        refresh: 'do-not-retry',
+        expires: 1,
+      }
+      try {
+        await expect(oauth.refresh(credential)).rejects.toThrow()
+        await expect(oauth.refresh(credential)).rejects.toThrow()
+        expect(calls).toBe(1)
+      } finally {
+        globalThis.fetch = originalFetch
+      }
     } finally {
       await cleanup()
     }
